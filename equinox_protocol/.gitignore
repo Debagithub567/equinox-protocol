@@ -1,0 +1,25 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+# Rust / Anchor
+target/
+test-ledger/
+.anchor/
+
+# Node
+node_modules/
+.next/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+.env.local
+
+# Solana
+*.json
