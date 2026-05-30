@@ -1,0 +1,14 @@
+{
+  "name": "equinox-keeper",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.0",
+    "@drift-labs/sdk": "^2.99.0",
+    "@solana/web3.js": "^1.98.4",
+    "dotenv": "^16.0.0"
+  }
+}

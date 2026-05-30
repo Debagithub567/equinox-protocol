@@ -8,11 +8,11 @@ import {
   getAssociatedTokenAddressSync,
   createAssociatedTokenAccountInstruction,
 } from "@solana/spl-token";
-import { getProgram, VAULT_SEED, SOL_VAULT_SEED, PROGRAM_ID } from "@/lib/program";
+import { getProgram, VAULT_SEED, SOL_VAULT_SEED, PROGRAM_ID, PYTH_SOL_USD_FEED } from "@/lib/program";
 
 interface Props {
   susdMint: PublicKey | null;
-  onDeposited: (susdAmount: number, ts: number) => void;
+  onDeposited: (susdAmount: number, ts: number, sig: string) => void;
 }
 
 export function DepositPanel({ susdMint, onDeposited }: Props) {
@@ -44,7 +44,13 @@ export function DepositPanel({ susdMint, onDeposited }: Props) {
       const lamports = Math.floor(parseFloat(sol) * LAMPORTS_PER_SOL);
       setStatus("Waiting for signature...");
 
-      await (program.methods as never as { depositAsset: (a: BN) => { preInstructions: (i: never[]) => { accounts: (a: object) => { rpc: () => Promise<string> } } } })
+      const sig = await (program.methods as never as {
+        depositAsset: (a: BN) => {
+          preInstructions: (i: never[]) => {
+            accounts: (a: object) => { rpc: () => Promise<string> };
+          };
+        };
+      })
         .depositAsset(new BN(lamports))
         .preInstructions(preIxs as never[])
         .accounts({
@@ -53,15 +59,17 @@ export function DepositPanel({ susdMint, onDeposited }: Props) {
           susdMint,
           userSusdAccount: userAta,
           user: wallet.publicKey,
+          priceUpdate: PYTH_SOL_USD_FEED,
           tokenProgram: TOKEN_2022_PROGRAM_ID,
           systemProgram: SystemProgram.programId,
         })
         .rpc();
 
-      const solPrice = 150;
+      // Estimate minted amount (frontend display — real amount from chain)
+      const solPrice = 150; // will be replaced by actual on-chain, this is display only
       const susd = parseFloat(sol) * solPrice;
       setStatus(`✅ Minted ~${susd.toFixed(2)} sUSD`);
-      onDeposited(susd, Date.now());
+      onDeposited(susd, Date.now(), sig);
     } catch (e: unknown) {
       setStatus(`❌ ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -72,6 +80,7 @@ export function DepositPanel({ susdMint, onDeposited }: Props) {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-6 flex flex-col gap-4">
       <h2 className="text-sm text-zinc-400 tracking-widest uppercase">Deposit SOL</h2>
+      <p className="text-xs text-zinc-600">Price sourced from Pyth oracle on-chain</p>
       <div className="flex gap-2">
         <input
           type="number"
@@ -89,9 +98,7 @@ export function DepositPanel({ susdMint, onDeposited }: Props) {
       >
         {loading ? "Processing..." : "Deposit & Mint sUSD"}
       </button>
-      {status && (
-        <p className="text-xs text-zinc-500 text-center">{status}</p>
-      )}
+      {status && <p className="text-xs text-zinc-500 text-center">{status}</p>}
     </div>
   );
 }

@@ -1,6 +1,14 @@
+use pyth_solana_receiver_sdk::price_update::{PriceUpdateV2, get_feed_id_from_hex};
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
+
 use anchor_spl::token_2022::{self, Token2022};
+use anchor_spl::token_interface::{
+    Mint,
+    TokenAccount,
+    TokenInterface,
+    MintTo,
+    mint_to,
+};
 use spl_token_2022::extension::interest_bearing_mint::instruction as interest_ix;
 
 declare_id!("CDN8JEfQibSy7RTzJacy8eXHrVTpGFTXmCqGAiZqASZ5");
@@ -61,54 +69,65 @@ pub mod equinox_protocol {
     }
 
     pub fn deposit_asset(ctx: Context<DepositAsset>, amount_lamports: u64) -> Result<()> {
-        require!(amount_lamports > 0, EquinoxError::ZeroDeposit);
+    // SOL/USD Pyth feed ID on devnet
+    let sol_usd_feed_id = get_feed_id_from_hex(
+        "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"
+    )?;
 
-        let transfer_ctx = CpiContext::new(
-            ctx.accounts.system_program.to_account_info(),
-            system_program::Transfer {
-                from: ctx.accounts.user.to_account_info(),
-                to: ctx.accounts.sol_vault.to_account_info(),
-            },
-        );
-        system_program::transfer(transfer_ctx, amount_lamports)?;
+    let price_update = &ctx.accounts.price_update;
+    let price = price_update.get_price_no_older_than(
+        &Clock::get()?,
+        60, // max 60 seconds old
+        &sol_usd_feed_id,
+    )?;
 
-        let sol_usd_price: u64 = 150;
-        let susd_to_mint = amount_lamports
-            .checked_div(1_000_000_000)
-            .ok_or(EquinoxError::MathOverflow)?
-            .checked_mul(sol_usd_price)
-            .ok_or(EquinoxError::MathOverflow)?
-            .checked_mul(10u64.pow(SUSD_DECIMALS as u32))
-            .ok_or(EquinoxError::MathOverflow)?;
+    // price.price is i64, exponent is negative (e.g. -8)
+    // sol_usd = price * 10^exponent → normalize to u64 dollars
+    let sol_usd_price = (price.price as u64)
+        .checked_div(10u64.pow((-price.exponent) as u32 - 2))
+        .ok_or(ErrorCode::MathOverflow)?;
 
-        msg!(
-            "🔀 MOCK PERP: Opening 1x SHORT | size={} lamports | price=${}",
-            amount_lamports,
-            sol_usd_price
-        );
-        msg!(
-            "📊 delta_neutral=true | funding_rate_bps={}",
-            ctx.accounts.vault_config.current_apy_bps
-        );
+    // Transfer SOL to vault
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.system_program.to_account_info(),
+        anchor_lang::system_program::Transfer {
+            from: ctx.accounts.user.to_account_info(),
+            to: ctx.accounts.sol_vault.to_account_info(),
+        },
+    );
+    anchor_lang::system_program::transfer(cpi_ctx, amount_lamports)?;
 
-        let bump = ctx.accounts.vault_config.bump;
-        let seeds = &[VAULT_SEED, std::slice::from_ref(&bump)];
-        let signer_seeds = &[&seeds[..]];
+    // Mint sUSD = SOL amount * price (2 decimal precision)
+    let sol_amount = amount_lamports / 1_000_000_000;
+    let susd_amount = sol_amount
+        .checked_mul(sol_usd_price)
+        .ok_or(ErrorCode::MathOverflow)?
+        .checked_mul(1_000_000) // 6 decimals
+        .ok_or(ErrorCode::MathOverflow)?;
 
-        let mint_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            token_2022::MintTo {
-                mint: ctx.accounts.susd_mint.to_account_info(),
-                to: ctx.accounts.user_susd_account.to_account_info(),
-                authority: ctx.accounts.vault_config.to_account_info(),
-            },
-            signer_seeds,
-        );
-        token_2022::mint_to(mint_ctx, susd_to_mint)?;
+    let seeds = &[b"vault_config".as_ref(), &[ctx.accounts.vault_config.bump]];
+    let signer = &[&seeds[..]];
 
-        msg!("✅ Minted {} sUSD to {}", susd_to_mint, ctx.accounts.user.key());
-        Ok(())
-    }
+    let mint_ctx = CpiContext::new_with_signer(
+        ctx.accounts.token_program.to_account_info(),
+        MintTo {
+            mint: ctx.accounts.susd_mint.to_account_info(),
+            to: ctx.accounts.user_susd_account.to_account_info(),
+            authority: ctx.accounts.vault_config.to_account_info(),
+        },
+        signer,
+    );
+    mint_to(mint_ctx, susd_amount)?;
+
+    ctx.accounts.vault_config.total_sol_deposited = ctx.accounts.vault_config
+        .total_sol_deposited
+        .checked_add(amount_lamports)
+        .ok_or(ErrorCode::MathOverflow)?;
+
+    msg!("Deposited {} lamports, minted {} sUSD units at ${} SOL",
+        amount_lamports, susd_amount, sol_usd_price);
+    Ok(())
+}
 
     pub fn redeem_asset(ctx: Context<RedeemAsset>, susd_amount: u64) -> Result<()> {
         require!(susd_amount > 0, EquinoxError::ZeroDeposit);
@@ -132,8 +151,26 @@ pub mod equinox_protocol {
             .checked_mul(1_000_000_000)
             .ok_or(EquinoxError::MathOverflow)?;
 
-        **ctx.accounts.sol_vault.try_borrow_mut_lamports()? -= lamports_to_return;
-        **ctx.accounts.user.try_borrow_mut_lamports()? += lamports_to_return;
+        let vault_balance = ctx.accounts.sol_vault.lamports();
+        let rent = Rent::get()?;
+        let rent_exempt_min = rent.minimum_balance(0);
+        let available = vault_balance
+            .checked_sub(rent_exempt_min)
+            .ok_or(EquinoxError::InsufficientFunds)?;
+        require!(lamports_to_return <= available, EquinoxError::InsufficientFunds);
+        let seeds: &[&[u8]] = &[SOL_VAULT_SEED, &[ctx.bumps.sol_vault]];
+let signer_seeds = &[seeds];
+anchor_lang::system_program::transfer(
+    CpiContext::new_with_signer(
+        ctx.accounts.system_program.to_account_info(),
+        anchor_lang::system_program::Transfer {
+            from: ctx.accounts.sol_vault.to_account_info(),
+            to: ctx.accounts.user.to_account_info(),
+        },
+        signer_seeds,
+    ),
+    lamports_to_return,
+)?;
 
         msg!("✅ Redeemed {} sUSD → {} lamports", susd_amount, lamports_to_return);
         Ok(())
@@ -184,10 +221,12 @@ pub struct VaultConfig {
     pub susd_mint: Pubkey,
     pub current_apy_bps: i16,
     pub bump: u8,
+    pub total_sol_deposited: u64,
 }
 
 impl VaultConfig {
-    pub const LEN: usize = 8 + 32 + 32 + 32 + 2 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 32 + 2 + 1 + 8;
+    
 }
 
 // ─── Contexts ─────────────────────────────────────────────────────────────────
@@ -218,34 +257,30 @@ pub struct InitializeVault<'info> {
 pub struct DepositAsset<'info> {
     #[account(
         mut,
-        seeds = [VAULT_SEED],
-        bump = vault_config.bump
+        seeds = [b"vault_config"],
+        bump = vault_config.bump,
     )]
     pub vault_config: Account<'info, VaultConfig>,
 
-    /// CHECK: SOL escrow PDA
     #[account(
         mut,
-        seeds = [SOL_VAULT_SEED],
-        bump
+        seeds = [b"sol_vault"],
+        bump,
     )]
-    pub sol_vault: UncheckedAccount<'info>,
+    pub sol_vault: SystemAccount<'info>,
 
-    /// CHECK: Token-2022 mint verified by constraint
-    #[account(
-        mut,
-        constraint = susd_mint.key() == vault_config.susd_mint @ EquinoxError::InvalidMint
-    )]
-    pub susd_mint: UncheckedAccount<'info>,
-
-    /// CHECK: User's sUSD ATA — validated by token program
     #[account(mut)]
-    pub user_susd_account: UncheckedAccount<'info>,
+    pub susd_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(mut)]
+    pub user_susd_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program: Program<'info, Token2022>,
+    pub price_update: Account<'info, PriceUpdateV2>,
+
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -314,4 +349,13 @@ pub enum EquinoxError {
     MathOverflow,
     #[msg("Invalid mint account")]
     InvalidMint,
+    #[msg("Insufficient funds in vault")]
+    InsufficientFunds,
 }
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Math overflow")]
+    MathOverflow,
+}
+

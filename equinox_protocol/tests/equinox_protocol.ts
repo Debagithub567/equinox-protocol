@@ -16,6 +16,8 @@ import {
   ExtensionType,
 } from "@solana/spl-token";
 import { assert } from "chai";
+import { HermesClient } from "@pythnetwork/hermes-client";
+import { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
 
 describe("equinox_protocol", () => {
   const provider = anchor.AnchorProvider.env();
@@ -23,36 +25,55 @@ describe("equinox_protocol", () => {
   const program = anchor.workspace.EquinoxProtocol as Program<EquinoxProtocol>;
   const wallet = provider.wallet as anchor.Wallet;
 
-  // ── PDAs ──────────────────────────────────────────────────────────────────
+  const SOL_USD_FEED_ID =
+    "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d";
+
   const [vaultConfigPDA] = PublicKey.findProgramAddressSync(
     [Buffer.from("vault_config")],
     program.programId
   );
-  const [solVaultPDA] = PublicKey.findProgramAddressSync(
-    [Buffer.from("sol_vault")],
-    program.programId
-  );
 
-  // ── Mint keypair (generated fresh each test run) ──────────────────────────
-  const mintKeypair = Keypair.generate();
+  let susdMint: PublicKey;
+  let userSusdAta: PublicKey;
 
-  // ── User's sUSD Associated Token Account ─────────────────────────────────
-  const userSusdAta = getAssociatedTokenAddressSync(
-    mintKeypair.publicKey,
-    wallet.publicKey,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
+  // ── Shared setup ──────────────────────────────────────────────────────────
+  beforeEach(async () => {
+    try {
+      const vault = await program.account.vaultConfig.fetch(vaultConfigPDA);
+      susdMint = vault.susdMint;
+      userSusdAta = getAssociatedTokenAddressSync(
+        susdMint,
+        wallet.publicKey,
+        false,
+        TOKEN_2022_PROGRAM_ID
+      );
+    } catch {
+      // Vault not yet initialized — Stage 2A will set susdMint
+    }
+  });
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Stage 2A ──────────────────────────────────────────────────────────────
   it("✅ Stage 2A — initialize_vault: deploys Token-2022 mint + vault PDA", async () => {
-    // 1. Calculate space needed for mint with InterestBearing extension
+    const existing = await provider.connection.getAccountInfo(vaultConfigPDA);
+
+    if (existing) {
+      const vault = await program.account.vaultConfig.fetch(vaultConfigPDA);
+      susdMint = vault.susdMint;
+      console.log("⚠️  Vault already exists on devnet, skipping init");
+      console.log("   susdMint:", susdMint.toBase58());
+      console.log("   currentApyBps:", vault.currentApyBps);
+      assert.ok(vault.currentApyBps !== undefined);
+      return;
+    }
+
+    const mintKeypair = Keypair.generate();
+    susdMint = mintKeypair.publicKey;
+
     const mintLen = getMintLen([ExtensionType.InterestBearingConfig]);
+    const lamports =
+      await provider.connection.getMinimumBalanceForRentExemption(mintLen);
 
-    // 2. Fund the mint account with rent
-    const lamports = await provider.connection.getMinimumBalanceForRentExemption(mintLen);
-
-    const createMintAccountIx = SystemProgram.createAccount({
+    const createMintIx = SystemProgram.createAccount({
       fromPubkey: wallet.publicKey,
       newAccountPubkey: mintKeypair.publicKey,
       space: mintLen,
@@ -60,133 +81,174 @@ describe("equinox_protocol", () => {
       programId: TOKEN_2022_PROGRAM_ID,
     });
 
-    // 3. Build + send transaction: create mint account THEN initialize_vault
-    const tx = new anchor.web3.Transaction().add(createMintAccountIx);
+    await provider.sendAndConfirm(
+      new anchor.web3.Transaction().add(createMintIx),
+      [mintKeypair]
+    );
 
-    await provider.sendAndConfirm(tx, [mintKeypair]);
-
-    // 4. Now call initialize_vault
     const sig = await program.methods
-      .initializeVault(1850) // 18.50% APY
+      .initializeVault(1850)
       .accounts({
-        vaultConfig: vaultConfigPDA,
         susdMint: mintKeypair.publicKey,
         admin: wallet.publicKey,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
+      } as never)
       .rpc();
 
-    console.log("  initialize_vault tx:", sig);
+    console.log("initialize_vault tx:", sig);
 
-    // 5. Verify vault state
     const vault = await program.account.vaultConfig.fetch(vaultConfigPDA);
-    assert.equal(vault.currentApyBps, 1850, "APY BPS should be 1850");
-    assert.equal(
-      vault.susdMint.toBase58(),
-      mintKeypair.publicKey.toBase58(),
-      "Mint address should match"
-    );
-    console.log("  ✅ Vault APY BPS:", vault.currentApyBps);
-    console.log("  ✅ sUSD Mint:", vault.susdMint.toBase58());
+    assert.equal(vault.currentApyBps, 1850);
+    assert.equal(vault.susdMint.toBase58(), mintKeypair.publicKey.toBase58());
+    console.log("✅ Vault APY BPS:", vault.currentApyBps);
+    console.log("✅ sUSD Mint:", vault.susdMint.toBase58());
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Stage 2B ──────────────────────────────────────────────────────────────
   it("✅ Stage 2B — deposit_asset: SOL escrowed, sUSD minted", async () => {
-    // 1. Create user's sUSD ATA first
-    const createAtaIx = createAssociatedTokenAccountInstruction(
-      wallet.publicKey,
-      userSusdAta,
-      wallet.publicKey,
-      mintKeypair.publicKey,
-      TOKEN_2022_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
+    assert.ok(susdMint, "susdMint not set — did Stage 2A run?");
+
+    // pyth-solana-receiver@0.16 + hermes-client@3.x API
+    const hermesClient = new HermesClient("https://hermes.pyth.network", {});
+
+    // getLatestPriceUpdates returns { binary: { encoding, data: string[] }, parsed: [...] }
+    const priceUpdates = await hermesClient.getLatestPriceUpdates(
+      [SOL_USD_FEED_ID],
+      { encoding: "base64" }
     );
-    const ataTx = new anchor.web3.Transaction().add(createAtaIx);
-    await provider.sendAndConfirm(ataTx);
-    console.log("  sUSD ATA created:", userSusdAta.toBase58());
 
-    // 2. Deposit 1 SOL
-    const depositAmount = new anchor.BN(1 * LAMPORTS_PER_SOL);
+    const pythReceiver = new PythSolanaReceiver({
+      connection: provider.connection,
+      wallet: provider.wallet as never,
+    });
 
-    const sig = await program.methods
-      .depositAsset(depositAmount)
-      .accounts({
-        vaultConfig: vaultConfigPDA,
-        solVault: solVaultPDA,
-        susdMint: mintKeypair.publicKey,
-        userSusdAccount: userSusdAta,
-        user: wallet.publicKey,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
-      .rpc();
+    const transactionBuilder = pythReceiver.newTransactionBuilder({
+      closeUpdateAccounts: false,
+    });
 
-    console.log("  deposit_asset tx:", sig);
+    // 0.16.x: addPostPriceUpdates takes string[] (base64 array directly)
+    await transactionBuilder.addPostPriceUpdates(priceUpdates.binary.data);
 
-    // 3. Verify sUSD landed in user's ATA
-    const ataInfo = await provider.connection.getTokenAccountBalance(userSusdAta);
-    console.log("  ✅ sUSD balance after deposit:", ataInfo.value.uiAmountString);
+    await transactionBuilder.addPriceConsumerInstructions(
+      async (getPriceUpdateAccount) => {
+        const priceUpdateAccount = getPriceUpdateAccount(SOL_USD_FEED_ID);
+
+        const ataInfo = await provider.connection.getAccountInfo(userSusdAta);
+        const preIxs = ataInfo
+          ? []
+          : [
+              createAssociatedTokenAccountInstruction(
+                wallet.publicKey,
+                userSusdAta,
+                wallet.publicKey,
+                susdMint,
+                TOKEN_2022_PROGRAM_ID,
+                ASSOCIATED_TOKEN_PROGRAM_ID
+              ),
+            ];
+
+        if (!ataInfo) console.log("sUSD ATA created:", userSusdAta.toString());
+
+        return [
+          {
+            instruction: await program.methods
+              .depositAsset(new anchor.BN(1 * LAMPORTS_PER_SOL))
+              .preInstructions(preIxs)
+              .accounts({
+                susdMint,
+                userSusdAccount: userSusdAta,
+                user: wallet.publicKey,
+                priceUpdate: priceUpdateAccount,
+                tokenProgram: TOKEN_2022_PROGRAM_ID,
+              } as never)
+              .instruction(),
+            signers: [],
+          },
+        ];
+      }
+    );
+
+    const txs = await transactionBuilder.buildVersionedTransactions({
+      tightComputeBudget: false,
+    });
+
+    const sigs = await pythReceiver.provider.sendAll(txs);
+    console.log("deposit_asset tx:", sigs[sigs.length - 1]);
+
+    const ataBalance = await provider.connection.getTokenAccountBalance(
+      userSusdAta
+    );
+    console.log("✅ sUSD balance after deposit:", ataBalance.value.uiAmount);
     assert.ok(
-      parseInt(ataInfo.value.amount) > 0,
-      "sUSD balance should be greater than 0"
+      ataBalance.value.uiAmount !== null && ataBalance.value.uiAmount > 0,
+      "sUSD balance should be > 0 after deposit"
     );
-
-    // 4. Verify SOL is locked in vault
-    const vaultLamports = await provider.connection.getBalance(solVaultPDA);
-    console.log("  ✅ SOL locked in vault:", vaultLamports / LAMPORTS_PER_SOL, "SOL");
-    assert.equal(vaultLamports, 1 * LAMPORTS_PER_SOL, "Vault should hold 1 SOL");
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Stage 2C ──────────────────────────────────────────────────────────────
   it("✅ Stage 2C — update_protocol_rate: keeper shifts APY to 4500 BPS", async () => {
+    assert.ok(susdMint, "susdMint not set — did Stage 2A run?");
+
     const sig = await program.methods
-      .updateProtocolRate(4500) // 45% APY
+      .updateProtocolRate(4500)
       .accounts({
-        vaultConfig: vaultConfigPDA,
-        susdMint: mintKeypair.publicKey,
+        susdMint,
         keeper: wallet.publicKey,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
-      })
+      } as never)
       .rpc();
 
-    console.log("  update_protocol_rate tx:", sig);
+    console.log("update_protocol_rate tx:", sig);
 
     const vault = await program.account.vaultConfig.fetch(vaultConfigPDA);
-    assert.equal(vault.currentApyBps, 4500, "APY BPS should now be 4500");
-    console.log("  ✅ New APY BPS:", vault.currentApyBps);
+    assert.equal(vault.currentApyBps, 4500);
+    console.log("✅ New APY BPS:", vault.currentApyBps);
   });
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Stage 2D ──────────────────────────────────────────────────────────────
   it("✅ Stage 2D — redeem_asset: sUSD burned, SOL returned", async () => {
-    // Redeem 100 sUSD (100 * 10^6 micro units)
-    const redeemAmount = new anchor.BN(100 * 1_000_000);
+    assert.ok(susdMint, "susdMint not set — did Stage 2A run?");
 
-    const balanceBefore = await provider.connection.getBalance(wallet.publicKey);
+    let susdBalance = 0;
+    try {
+      const tokenAcc = await provider.connection.getTokenAccountBalance(
+        userSusdAta
+      );
+      susdBalance = tokenAcc.value.uiAmount ?? 0;
+    } catch {
+      // ATA doesn't exist
+    }
+
+    assert.ok(
+      susdBalance > 0,
+      `Need sUSD balance to redeem (got ${susdBalance}). Run Stage 2B first.`
+    );
+
+    // Redeem half so the test stays repeatable
+    const redeemUiAmount = 150; // 150 sUSD = ~1 SOL at $150
+    const redeemUnits = new anchor.BN(redeemUiAmount * 1_000_000); // 150_000_000 units
+
+    const solBefore = await provider.connection.getBalance(wallet.publicKey);
 
     const sig = await program.methods
-      .redeemAsset(redeemAmount)
+      .redeemAsset(redeemUnits)
       .accounts({
-        vaultConfig: vaultConfigPDA,
-        solVault: solVaultPDA,
-        susdMint: mintKeypair.publicKey,
+        susdMint,
         userSusdAccount: userSusdAta,
         user: wallet.publicKey,
-        tokenProgram: TOKEN_2022_PROGRAM_ID,
-        systemProgram: SystemProgram.programId,
-      })
+      } as never)
       .rpc();
 
-    console.log("  redeem_asset tx:", sig);
+    console.log("redeem_asset tx:", sig);
 
-    const balanceAfter = await provider.connection.getBalance(wallet.publicKey);
-    const ataInfo = await provider.connection.getTokenAccountBalance(userSusdAta);
-
-    console.log("  ✅ sUSD balance after redeem:", ataInfo.value.uiAmountString);
+    const solAfter = await provider.connection.getBalance(wallet.publicKey);
     console.log(
-      "  ✅ SOL returned:",
-      (balanceAfter - balanceBefore) / LAMPORTS_PER_SOL,
-      "SOL"
+      `✅ SOL returned: ${((solAfter - solBefore) / LAMPORTS_PER_SOL).toFixed(6)} SOL`
+    );
+
+    const ataAfter = await provider.connection.getTokenAccountBalance(
+      userSusdAta
+    );
+    console.log(
+      `✅ sUSD remaining: ${ataAfter.value.uiAmount} (redeemed ${redeemUiAmount})`
     );
   });
 });

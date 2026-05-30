@@ -20,3 +20,5 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 anchor-lang = "0.31.0"
 anchor-spl = { version = "0.31.0", features = ["token_2022"] }
 spl-token-2022 = { version = "6.0.0", features = ["no-entrypoint"] }
+
+pyth-solana-receiver-sdk = "0.3.0"
