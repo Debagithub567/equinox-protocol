@@ -1,0 +1,5 @@
+[build]
+  base = "equinox-frontend"
+  command = "npm run build"
+  publish = ".next"
+
